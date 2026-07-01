@@ -8,7 +8,7 @@ All processing happens on-device — nothing leaves the machine.
 
 | Dependency | Notes |
 |---|---|
-| GIMP 3.0 | Available at [gimp.org](https://www.gimp.org) |
+| GIMP 3.x | Available at [gimp.org](https://www.gimp.org) |
 | WithoutBG server | Must be running at `http://127.0.0.1:8000` — Docker `service-cpu` / `service-gpu`, or the Mac server app (or change `SERVER_URL` in `withoutbg/withoutbg.py`) |
 
 ### Start a server
@@ -26,7 +26,7 @@ Run one backend at a time on port 8000.
 ## Install
 
 ```bash
-sh -c "$(curl -fsSL https://raw.githubusercontent.com/withoutbg/withoutbg-gimp/main/install.sh)"
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/withoutbg/withoutbg-gimp/main/install.sh)"
 ```
 
 Or, if you already have the repo:
@@ -69,7 +69,7 @@ interactive dialog — GIMP remembers the last-used value between runs.
 ## Uninstall
 
 ```bash
-rm -rf ~/Library/Application\ Support/GIMP/3.0/plug-ins/withoutbg   # macOS
+rm -rf ~/Library/Application\ Support/GIMP/3.*/plug-ins/withoutbg   # macOS
 # or
-rm -rf ~/.config/GIMP/3.0/plug-ins/withoutbg                        # Linux
+rm -rf ~/.config/GIMP/3.*/plug-ins/withoutbg                        # Linux
 ```
