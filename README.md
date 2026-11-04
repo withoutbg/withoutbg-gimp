@@ -94,7 +94,7 @@ This plugin is the **GIMP 3** path: mask-first cutouts via a local server. Same 
 
 The withoutBG Open Weights Model (v4, 10.12.4) is a routed bundle: a trained router sends fine strands, soft detail and transparency to the withoutBG matting branch and hard opaque objects, flat scenes and vehicles to BiRefNet. Built with DINOv3.
 
-**Fixing a mask:** v4 servers also take Keep / Remove strokes (`keep_mask` / `remove_mask` / `matte` on `/v1/remove-background`). Until the plugin gets a brush, use the *Fix with Brush* editor in the Mac app or the Docker web app, or paint the layer mask in GIMP as usual.
+**Fixing a mask:** v4 servers also take Smart brush strokes (`keep_mask` / `remove_mask` / `matte` on `/v1/remove-background`). Until the plugin gets a brush, use Smart brush in the Mac app or the Docker web app, or paint the layer mask in GIMP as usual.
 
 Licensed under the [withoutBG Open Model License](https://withoutbg.com/open-model/license?utm_source=github&utm_medium=readme&utm_campaign=open-weights-v4&utm_content=withoutbg-gimp-open-model-license) (Apache 2.0 for withoutBG portions; Meta DINOv3 License for DINOv3 backbone weights).
 
