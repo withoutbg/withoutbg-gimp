@@ -70,6 +70,10 @@ The default server URL (`http://127.0.0.1:8000`) is hardcoded at the top of
 `withoutbg/withoutbg.py`. You can also change it per-session inside the
 interactive dialog — GIMP remembers the last-used value between runs.
 
+### Optional: withoutBG Pro
+
+No server running, or you want the hosted model? Tick **Use withoutBG Pro (cloud)** in the dialog and paste an API key, or set `WITHOUTBG_API_KEY` in the environment GIMP starts from. With Pro on, the layer (downscaled to 1024 px) is sent to api.withoutbg.com and uses 1 credit. The matte still comes back as an unapplied layer mask. GIMP stores the last-used dialog values, the key included, in your GIMP profile. Use the environment variable if you'd rather keep it out of there. Keys: [withoutBG Pro](https://withoutbg.com/pro-model-api?utm_source=github&utm_medium=readme&utm_campaign=open-weights-v4&utm_content=withoutbg-gimp-pro-model-api).
+
 ## Uninstall
 
 ```bash

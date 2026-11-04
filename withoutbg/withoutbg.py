@@ -2,7 +2,8 @@
 # -*- coding: utf-8 -*-
 #
 # WithoutBG — GIMP 3 Plugin
-# Removes image backgrounds using a local WithoutBG server (Docker or Mac app).
+# Removes image backgrounds using a local WithoutBG server (Docker or Mac app),
+# or, opt-in, withoutBG Pro (hosted API, needs an API key).
 #
 # Install:  place this directory inside GIMP's plug-ins folder, e.g.
 #   ~/Library/Application Support/GIMP/3.0/plug-ins/   (macOS)
@@ -28,12 +29,19 @@ import sys
 import json
 import traceback
 import tempfile
+import uuid
 import urllib.request
 import urllib.error
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
+PLUGIN_VERSION = "1.1.0"
+
 SERVER_URL = "http://127.0.0.1:8000"
+
+# withoutBG Pro (opt-in). Key from the dialog, or the WITHOUTBG_API_KEY env var.
+PRO_API_URL = os.environ.get("WITHOUTBG_API_URL", "https://api.withoutbg.com").rstrip("/")
+PRO_KEY_URL = "https://withoutbg.com/pro-model-api?utm_source=gimp&utm_medium=plugin&utm_campaign=open-weights-v4&utm_content=withoutbg-gimp-dialog"
 
 # The server downsamples input so the longest side is at most this many pixels.
 # We match that locally before POSTing to avoid 413 payloads and to keep the
@@ -49,10 +57,25 @@ def _fit_longest_side(width, height, max_side=MAX_SERVER_SIDE):
         return width, height
     return max(1, round(width * scale)), max(1, round(height * scale))
 
+def _user_agent():
+    """e.g. 'withoutbg-gimp/1.1.0 (GIMP 3.0.2; linux)'. No user identifiers."""
+    try:
+        gimp_ver = Gimp.version()
+    except Exception:
+        gimp_ver = "3"
+    return f"withoutbg-gimp/{PLUGIN_VERSION} (GIMP {gimp_ver}; {sys.platform})"
+
+
+def _request(url, data=None, method='GET'):
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header('User-Agent', _user_agent())
+    return req
+
+
 def _health_check(server_url):
     """Return (ok: bool, info: dict | str)."""
     try:
-        with urllib.request.urlopen(f"{server_url}/health", timeout=5) as r:
+        with urllib.request.urlopen(_request(f"{server_url}/health"), timeout=5) as r:
             return True, json.loads(r.read())
     except Exception as exc:
         return False, str(exc)
@@ -120,7 +143,7 @@ def _export_layer_png(image, layer, path, max_side=None):
 def _post_image(png_bytes, server_url, output_type):
     """POST *png_bytes* to the server. Returns (result_bytes, latency_str)."""
     url = f"{server_url}/v1/remove-background?output={output_type}"
-    req = urllib.request.Request(url, data=png_bytes, method='POST')
+    req = _request(url, data=png_bytes, method='POST')
     req.add_header('Content-Type', 'image/png')
     try:
         with urllib.request.urlopen(req, timeout=120) as resp:
@@ -137,6 +160,36 @@ def _post_image(png_bytes, server_url, output_type):
         raise RuntimeError(
             f"Cannot reach WithoutBG server at {server_url}\n{exc.reason}"
         ) from exc
+
+
+_PRO_ERRORS = {
+    401: 'withoutBG Pro rejected the API key. Check the key in the dialog.',
+    402: 'Out of withoutBG Pro credits.',
+    403: 'This API key cannot use withoutBG Pro.',
+    429: 'withoutBG Pro rate limit reached. Try again shortly.',
+}
+
+
+def _post_pro(png_bytes, api_key):
+    """POST *png_bytes* to withoutBG Pro; returns (matte_png_bytes, latency_str)."""
+    boundary = uuid.uuid4().hex
+    body = (
+        f'--{boundary}\r\n'
+        'Content-Disposition: form-data; name="file"; filename="image.png"\r\n'
+        'Content-Type: image/png\r\n\r\n'
+    ).encode() + png_bytes + f'\r\n--{boundary}--\r\n'.encode()
+    req = _request(f'{PRO_API_URL}/v1.0/alpha-channel', data=body, method='POST')
+    req.add_header('Content-Type', f'multipart/form-data; boundary={boundary}')
+    req.add_header('X-API-Key', api_key)
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            return resp.read(), resp.headers.get('X-Latency-Ms', '?')
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(
+            _PRO_ERRORS.get(exc.code, f'withoutBG Pro returned HTTP {exc.code}.')
+        ) from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f'Cannot reach withoutBG Pro\n{exc.reason}') from exc
 
 
 def _layer_offsets(layer):
@@ -260,6 +313,19 @@ def _server_status_markup(server_url):
     return f'Server not reachable at {server_url} — {info}'
 
 
+def _read_config(config):
+    """Return (server_url, use_pro, api_key) from the procedure config."""
+    def get(name, default):
+        try:
+            value = config.get_property(name)
+        except Exception:
+            return default
+        return default if value in (None, '') else value
+
+    api_key = (get('api-key', '') or os.environ.get('WITHOUTBG_API_KEY', '')).strip()
+    return get('server-url', SERVER_URL), bool(get('use-pro', False)), api_key
+
+
 # ── Procedure callback ────────────────────────────────────────────────────────
 
 def run_remove_background(procedure, run_mode, image, drawables, config, data):
@@ -271,10 +337,7 @@ def run_remove_background(procedure, run_mode, image, drawables, config, data):
     Note: no separate n_drawables — GIMP 3 Python passes a plain list.
     """
     try:
-        try:
-            server_url = config.get_property('server-url') or SERVER_URL
-        except Exception:
-            server_url = SERVER_URL
+        server_url, use_pro, api_key = _read_config(config)
 
         target = _resolve_target(image, drawables)
         if target is None:
@@ -295,12 +358,14 @@ def run_remove_background(procedure, run_mode, image, drawables, config, data):
                 'Adds the cutout as an unapplied layer mask, in place.\n'
                 'Review it, then Layer ▸ Mask ▸ Apply Layer Mask to commit.\n\n'
                 f'Default server: {SERVER_URL} (Docker service-* or Mac server app).\n'
-                + _server_status_markup(server_url),
+                + _server_status_markup(server_url) + '\n\n'
+                'Optional: withoutBG Pro sends the layer to api.withoutbg.com\n'
+                f'(1 credit per image). API key: {PRO_KEY_URL}',
             )
             dialog.get_content_area().add(hint)
             hint.show()
 
-            dialog.fill(['server-url'])
+            dialog.fill(['server-url', 'use-pro', 'api-key'])
 
             if not dialog.run():
                 dialog.destroy()
@@ -309,12 +374,19 @@ def run_remove_background(procedure, run_mode, image, drawables, config, data):
                 )
             dialog.destroy()
 
-            try:
-                server_url = config.get_property('server-url') or SERVER_URL
-            except Exception:
-                server_url = SERVER_URL
+            server_url, use_pro, api_key = _read_config(config)
 
-        ok, info = _health_check(server_url)
+        if use_pro and not api_key:
+            Gimp.message(
+                'WithoutBG error:\n\n'
+                'withoutBG Pro needs an API key: enter it in the dialog or set '
+                f'WITHOUTBG_API_KEY.\n\nGet one at {PRO_KEY_URL}'
+            )
+            return procedure.new_return_values(
+                Gimp.PDBStatusType.EXECUTION_ERROR, GLib.Error()
+            )
+
+        ok, info = (True, None) if use_pro else _health_check(server_url)
         if not ok:
             Gimp.message(
                 'WithoutBG error:\n\n'
@@ -346,7 +418,10 @@ def run_remove_background(procedure, run_mode, image, drawables, config, data):
             # full-resolution image — no quality loss.
             Gimp.progress_init('WithoutBG: removing background…')
             Gimp.progress_update(0.35)
-            result_bytes, latency_ms = _post_image(png_bytes, server_url, 'matte')
+            if use_pro:
+                result_bytes, latency_ms = _post_pro(png_bytes, api_key)
+            else:
+                result_bytes, latency_ms = _post_image(png_bytes, server_url, 'matte')
 
             # 3 — load the matte and add it as a layer mask at full resolution
             Gimp.progress_init('WithoutBG: applying result…')
@@ -418,7 +493,7 @@ class WithoutBGPlugin(Gimp.PlugIn):
         proc.set_sensitivity_mask(Gimp.ProcedureSensitivityMask.DRAWABLE)
         proc.set_menu_label('Remove Background…')
         proc.set_documentation(
-            'Remove background via local WithoutBG server',
+            'Remove background via local WithoutBG server or withoutBG Pro',
             'Sends the active layer to a local WithoutBG server (Docker service-* '
             'or Mac app on port 8000), fetches the alpha matte, and adds it as an '
             'unapplied layer mask.',
@@ -431,6 +506,19 @@ class WithoutBGPlugin(Gimp.PlugIn):
             'server-url', 'Server URL',
             'URL of the local WithoutBG server (default port 8000)',
             SERVER_URL,
+            GObject.ParamFlags.READWRITE,
+        )
+        proc.add_boolean_argument(
+            'use-pro', 'Use withoutBG Pro (cloud)',
+            'Send the layer to the hosted withoutBG Pro API instead of the local '
+            'server. Needs an API key; 1 credit per image.',
+            False,
+            GObject.ParamFlags.READWRITE,
+        )
+        proc.add_string_argument(
+            'api-key', 'withoutBG Pro API key',
+            'Only used with withoutBG Pro. Empty: read WITHOUTBG_API_KEY.',
+            '',
             GObject.ParamFlags.READWRITE,
         )
 
