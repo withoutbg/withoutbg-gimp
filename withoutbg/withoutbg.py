@@ -57,6 +57,7 @@ KEEP_LAYER_NAME   = 'withoutBG Keep'
 REMOVE_LAYER_NAME = 'withoutBG Remove'
 PAINT_PARASITE    = 'withoutbg-paint'          # on paint layers: b"keep:<tattoo>" / b"remove:<tattoo>"
 CONTEXT_PARASITE  = 'withoutbg-edit-context'   # on the target layer: server editContext token
+ENGINE_PARASITE   = 'withoutbg-engine'         # on the target layer: b'pro' or b'open' (engine of the cutout)
 SERVER_PARASITE   = 'withoutbg-server-url'     # global: last local server used
 
 # ── Internals ─────────────────────────────────────────────────────────────────
@@ -184,14 +185,19 @@ _PRO_ERRORS = {
 }
 
 
-def _post_pro(png_bytes, api_key):
+def _post_pro(png_bytes, api_key, masks=None):
     """POST *png_bytes* to withoutBG Pro; returns (matte_png_bytes, latency_str)."""
     boundary = uuid.uuid4().hex
-    body = (
-        f'--{boundary}\r\n'
-        'Content-Disposition: form-data; name="file"; filename="image.png"\r\n'
-        'Content-Type: image/png\r\n\r\n'
-    ).encode() + png_bytes + f'\r\n--{boundary}--\r\n'.encode()
+    # The photo as ``file``; Smart brush adds ``keep_mask`` / ``remove_mask`` PNGs.
+    body = b''
+    for name, data in {'file': png_bytes, **(masks or {})}.items():
+        filename = 'image.png' if name == 'file' else f'{name}.png'
+        body += (
+            f'--{boundary}\r\n'
+            f'Content-Disposition: form-data; name="{name}"; filename="{filename}"\r\n'
+            'Content-Type: image/png\r\n\r\n'
+        ).encode() + data + b'\r\n'
+    body += f'--{boundary}--\r\n'.encode()
     req = _request(f'{PRO_API_URL}/v1.0/alpha-channel', data=body, method='POST')
     req.add_header('Content-Type', f'multipart/form-data; boundary={boundary}')
     req.add_header('X-API-Key', api_key)
@@ -588,7 +594,8 @@ def run_remove_background(procedure, run_mode, image, drawables, config, data):
                 + _server_status_markup(server_url) + '\n\n'
                 'Optional: withoutBG Pro sends the layer to api.withoutbg.com\n'
                 f'(1 credit per image). API key: {PRO_KEY_URL}\n\n'
-                'To fix the mask: Tools ▸ WithoutBG ▸ Smart Brush (local server).',
+                'To fix the mask: Tools ▸ WithoutBG ▸ Smart Brush (local server; Pro cutouts\n'
+                'need WITHOUTBG_API_KEY in the environment).',
             )
             dialog.get_content_area().add(hint)
             hint.show()
@@ -673,6 +680,12 @@ def run_remove_background(procedure, run_mode, image, drawables, config, data):
                 matte_img.delete()
                 # A new cutout: Smart brush starts from it with a fresh context.
                 _clear_parasite(target, CONTEXT_PARASITE)
+                # Remember which engine made it; Smart brush Apply follows it.
+                _set_parasite_bytes(target, ENGINE_PARASITE, b'pro' if use_pro else b'open')
+                if use_pro:
+                    # Pro strokes are the history of this cutout only: start empty.
+                    for layer in _paint_layers(image, target).values():
+                        layer.edit_clear()
             finally:
                 image.undo_group_end()
             if not use_pro:
@@ -757,6 +770,60 @@ def run_add_paint_layers(procedure, run_mode, image, drawables, config, data):
         return _fail(procedure, f'{exc}\n\n{traceback.format_exc()}')
 
 
+def _smart_brush_apply_pro(procedure, image, target, paint, painted):
+    """Smart brush Apply on a Pro cutout: the photo plus every stroke so far (1 credit).
+
+    Stateless on the server, so the paint layers are not cleared: each Apply sends
+    all strokes painted since the cutout was made. Needs WITHOUTBG_API_KEY (the
+    Smart Brush actions have no key field).
+    """
+    api_key = os.environ.get('WITHOUTBG_API_KEY', '').strip()
+    if not api_key:
+        return _fail(procedure, 'Smart brush on a withoutBG Pro cutout needs the API key in '
+                                'WITHOUTBG_API_KEY. Set it and restart GIMP.')
+
+    size = _fit_longest_side(target.get_width(), target.get_height())
+    tmp = {k: tempfile.mktemp(suffix=f'_wbg_{k}.png') for k in ('image', 'keep', 'remove', 'out')}
+    try:
+        Gimp.progress_init('WithoutBG: Smart brush (Pro)…')
+        Gimp.progress_update(0.1)
+        _export_layer_png(image, target, tmp['image'], max_side=MAX_SERVER_SIDE)
+        with open(tmp['image'], 'rb') as fh:
+            png_bytes = fh.read()
+        masks = {}
+        for role, layer in painted.items():
+            _export_marks_png(image, layer, tmp[role], size)
+            with open(tmp[role], 'rb') as fh:
+                masks[f'{role}_mask'] = fh.read()
+
+        Gimp.progress_update(0.4)
+        result_bytes, _latency = _post_pro(png_bytes, api_key, masks)
+
+        Gimp.progress_update(0.8)
+        with open(tmp['out'], 'wb') as fh:
+            fh.write(result_bytes)
+        matte_img = Gimp.file_load(Gimp.RunMode.NONINTERACTIVE, Gio.File.new_for_path(tmp['out']))
+        if matte_img is None:
+            raise RuntimeError('GIMP could not load the matte PNG.')
+
+        image.undo_group_start()
+        try:
+            _add_matte_mask(image, target, matte_img)
+            matte_img.delete()
+        finally:
+            image.undo_group_end()
+        Gimp.displays_flush()
+        Gimp.progress_update(1.0)
+    finally:
+        for path in tmp.values():
+            try:
+                if os.path.exists(path):
+                    os.unlink(path)
+            except OSError:
+                pass
+    return procedure.new_return_values(Gimp.PDBStatusType.SUCCESS, GLib.Error())
+
+
 def run_smart_brush_apply(procedure, run_mode, image, drawables, config, data):
     """Send the paint to the local server and update the layer mask in place."""
     try:
@@ -771,6 +838,9 @@ def run_smart_brush_apply(procedure, run_mode, image, drawables, config, data):
         if not painted:
             return _fail(procedure, 'Nothing painted yet. Use Smart Brush: Add Paint Layers, '
                                     f'then paint on "{KEEP_LAYER_NAME}" or "{REMOVE_LAYER_NAME}".')
+
+        if _get_parasite_bytes(target, ENGINE_PARASITE) == b'pro':
+            return _smart_brush_apply_pro(procedure, image, target, paint, painted)
 
         server_url = _remembered_server()
         ok, info = _health_check(server_url)

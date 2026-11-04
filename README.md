@@ -74,7 +74,7 @@ Something went missing, or a bit of background stayed? Paint over it instead of 
 
 Repeat 2–3 as often as you like. Hand edits to the mask are kept: Smart brush starts from the mask as it is. After the first Apply, later ones on the same layer are much faster: the server runs only the Smart brush model, not the full pipeline (the plugin keeps a small edit context on the layer, saved with XCF files).
 
-Smart brush runs on the local open-weights server (Docker or the Mac app, v4), also when the cutout came from withoutBG Pro. Like Remove Background, it works at up to 1024 px and the mask is scaled back to the layer size.
+Smart brush runs on the local open-weights server (Docker or the Mac app, v4). On a cutout made with withoutBG Pro it runs on Pro instead: each Apply sends the photo and every stroke so far (stateless, 1 credit per Apply), so paint stays on the layers until the cutout is replaced. Pro Smart brush needs `WITHOUTBG_API_KEY` in the environment. Like Remove Background, it works at up to 1024 px and the mask is scaled back to the layer size.
 
 ## Configuration
 
