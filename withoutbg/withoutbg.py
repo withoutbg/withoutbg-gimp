@@ -326,6 +326,33 @@ def _read_config(config):
     return get('server-url', SERVER_URL), bool(get('use-pro', False)), api_key
 
 
+def _mask_api_key_entry(dialog):
+    """Hide the API key (dots) with an eye icon to reveal it. Hidden by default.
+
+    Creates the key widget before `dialog.fill` so fill reuses it. Any failure
+    leaves the stock (visible) entry, so the dialog still works.
+    """
+    try:
+        widget = dialog.get_widget('api-key', GObject.TYPE_NONE)
+        entry = widget.get_entry() if hasattr(widget, 'get_entry') else widget
+        if not isinstance(entry, Gtk.Entry):
+            return
+        entry.set_visibility(False)
+        entry.set_input_purpose(Gtk.InputPurpose.PASSWORD)
+        pos = Gtk.EntryIconPosition.SECONDARY
+        entry.set_icon_from_icon_name(pos, 'gimp-visible')
+        entry.set_icon_activatable(pos, True)
+        entry.set_icon_tooltip_text(pos, 'Show / hide API key')
+
+        def toggle(e, icon_pos, _event):
+            if icon_pos == pos:
+                e.set_visibility(not e.get_visibility())
+
+        entry.connect('icon-press', toggle)
+    except Exception:
+        pass
+
+
 # ── Procedure callback ────────────────────────────────────────────────────────
 
 def run_remove_background(procedure, run_mode, image, drawables, config, data):
@@ -365,6 +392,7 @@ def run_remove_background(procedure, run_mode, image, drawables, config, data):
             dialog.get_content_area().add(hint)
             hint.show()
 
+            _mask_api_key_entry(dialog)
             dialog.fill(['server-url', 'use-pro', 'api-key'])
 
             if not dialog.run():
