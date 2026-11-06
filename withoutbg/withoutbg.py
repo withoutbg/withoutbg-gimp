@@ -52,6 +52,7 @@ SERVER_URL = "http://127.0.0.1:8000"
 # withoutBG Pro (opt-in). Key from the dialog, or the WITHOUTBG_API_KEY env var.
 PRO_API_URL = os.environ.get("WITHOUTBG_API_URL", "https://api.withoutbg.com").rstrip("/")
 PLUGIN_DOCS_URL = "https://withoutbg.com/open-model/plugins/gimp"
+SMART_BRUSH_URL = "https://withoutbg.com/smart-brush"
 PRO_KEY_URL = "https://withoutbg.com/pro-model-api?utm_source=gimp&utm_medium=plugin&utm_campaign=open-weights-v4&utm_content=withoutbg-gimp-dialog"
 
 # The server downsamples input so the longest side is at most this many pixels.
@@ -846,6 +847,7 @@ class SmartBrushDialog:
         self.status.set_line_wrap(True)
         status.pack_start(self.spinner, False, False, 0)
         status.pack_start(self.status, True, True, 0)
+        status.pack_end(_link_label([('How Smart Brush works', SMART_BRUSH_URL)]), False, False, 0)
         box.pack_start(status, False, False, 0)
         self._hint = (
             'Rough strokes are enough: green over what went missing, red over what should go. '
