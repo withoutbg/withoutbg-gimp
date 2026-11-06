@@ -51,6 +51,7 @@ SERVER_URL = "http://127.0.0.1:8000"
 
 # withoutBG Pro (opt-in). Key from the dialog, or the WITHOUTBG_API_KEY env var.
 PRO_API_URL = os.environ.get("WITHOUTBG_API_URL", "https://api.withoutbg.com").rstrip("/")
+DOCKER_DOCS_URL = "https://withoutbg.com/docs/open-model/docker"
 PRO_KEY_URL = "https://withoutbg.com/pro-model-api?utm_source=gimp&utm_medium=plugin&utm_campaign=open-weights-v4&utm_content=withoutbg-gimp-dialog"
 
 # The server downsamples input so the longest side is at most this many pixels.
@@ -362,6 +363,28 @@ def _read_config(config):
 
     api_key = (get('api-key', '') or os.environ.get('WITHOUTBG_API_KEY', '')).strip()
     return get('server-url', SERVER_URL), bool(get('use-pro', False)), api_key
+
+
+def _link_label(links):
+    """A label of clickable links, separated by '·'. *links*: [(text, url), ...]."""
+    label = Gtk.Label(xalign=0)
+    label.set_markup('   ·   '.join(
+        f'<a href="{GLib.markup_escape_text(url)}">{GLib.markup_escape_text(text)}</a>'
+        for text, url in links
+    ))
+    label.set_margin_top(6)
+    label.set_margin_bottom(6)
+
+    def open_link(_label, uri):
+        # Python's webbrowser works the same on Linux, macOS and Windows builds.
+        try:
+            import webbrowser
+            return bool(webbrowser.open(uri))
+        except Exception:
+            return False   # fall back to GTK's own handler
+
+    label.connect('activate-link', open_link)
+    return label
 
 
 def _mask_api_key_entry(dialog):
@@ -1163,12 +1186,18 @@ def run_remove_background(procedure, run_mode, image, drawables, config, data):
                 f'Default server: {SERVER_URL} (Docker service-* or Mac server app).\n'
                 + _server_status_markup(server_url) + '\n\n'
                 'Optional: withoutBG Pro sends the layer to api.withoutbg.com\n'
-                f'(1 credit per image). API key: {PRO_KEY_URL}\n\n'
+                '(1 credit per image, needs an API key).\n\n'
                 'To fix the mask: Tools ▸ WithoutBG ▸ Smart Brush… (local server; Pro cutouts\n'
                 'need WITHOUTBG_API_KEY in the environment).',
             )
             dialog.get_content_area().add(hint)
             hint.show()
+            links = _link_label([
+                ('Run the local server with Docker', DOCKER_DOCS_URL),
+                ('Get a withoutBG Pro API key', PRO_KEY_URL),
+            ])
+            dialog.get_content_area().add(links)
+            links.show()
 
             _mask_api_key_entry(dialog)
             dialog.fill(['server-url', 'use-pro', 'api-key'])
