@@ -14,6 +14,7 @@
 # The server must be running at SERVER_URL before you invoke the plug-in.
 #
 # Menu:  Tools ▸ WithoutBG ▸ Remove Background…
+#        Tools ▸ WithoutBG ▸ Smart Brush…
 #        Tools ▸ WithoutBG ▸ Smart Brush: Add Paint Layers
 #        Tools ▸ WithoutBG ▸ Smart Brush: Apply
 #
@@ -25,12 +26,17 @@ gi.require_version('Gimp',   '3.0')
 gi.require_version('GimpUi', '3.0')
 gi.require_version('Gtk',    '3.0')
 gi.require_version('Gegl',   '0.4')
-from gi.repository import Gimp, GimpUi, Gtk, GObject, GLib, Gio, Gegl
+gi.require_version('Gdk',    '3.0')
+gi.require_version('GdkPixbuf', '2.0')
+from gi.repository import Gimp, GimpUi, Gtk, Gdk, GdkPixbuf, GObject, GLib, Gio, Gegl
 
+import io
 import os
 import sys
 import json
+import math
 import base64
+import threading
 import traceback
 import tempfile
 import uuid
@@ -39,7 +45,7 @@ import urllib.error
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
-PLUGIN_VERSION = "1.2.0"
+PLUGIN_VERSION = "1.3.0"
 
 SERVER_URL = "http://127.0.0.1:8000"
 
@@ -59,6 +65,15 @@ PAINT_PARASITE    = 'withoutbg-paint'          # on paint layers: b"keep:<tattoo
 CONTEXT_PARASITE  = 'withoutbg-edit-context'   # on the target layer: server editContext token
 ENGINE_PARASITE   = 'withoutbg-engine'         # on the target layer: b'pro' or b'open' (engine of the cutout)
 SERVER_PARASITE   = 'withoutbg-server-url'     # global: last local server used
+STROKES_PARASITE  = 'withoutbg-pro-strokes'    # on the target layer: JSON of Pro dialog strokes
+
+# Smart brush dialog.
+BRUSH_KEEP_RGB    = (0.16, 0.78, 0.30)   # green: what went missing
+BRUSH_REMOVE_RGB  = (0.93, 0.20, 0.20)   # red: what should go
+BRUSH_ALPHA       = 0.55                 # stroke overlay opacity in the preview
+BRUSH_SMOOTHING   = 0.35                 # 0..1, lower = smoother, lazier strokes
+BRUSH_DEFAULT_PX  = 28                   # brush diameter in screen pixels
+BG_OPACITY_PCT    = 30                   # how much of the removed background shows
 
 # ── Internals ─────────────────────────────────────────────────────────────────
 
@@ -559,6 +574,561 @@ def _export_mask_png(layer, path, size):
         tmp.delete()
 
 
+# ── Smart brush dialog ────────────────────────────────────────────────────────
+#
+# The user paints Keep (green) / Remove (red) strokes straight on a preview of
+# the cutout. Strokes are stored as points in preview pixels (the preview is
+# the server size, ≤ 1024 px) and drawn as smooth Catmull-Rom splines, so a
+# shaky hand still gives a clean, rough guide. The GTK part below only needs
+# Gtk / Gdk / GdkPixbuf / cairo; the GIMP and server work is passed in.
+
+RESPONSE_APPLY = 1
+
+
+def _load_cairo():
+    """Return the pycairo module wired into GTK, or None when unavailable."""
+    try:
+        gi.require_foreign('cairo')
+        import cairo
+        return cairo
+    except Exception:
+        return None
+
+
+def _pixbuf_from_png(data, size=None):
+    loader = GdkPixbuf.PixbufLoader.new_with_type('png')
+    loader.write(data)
+    loader.close()
+    pixbuf = loader.get_pixbuf()
+    if size is not None and (pixbuf.get_width(), pixbuf.get_height()) != tuple(size):
+        pixbuf = pixbuf.scale_simple(size[0], size[1], GdkPixbuf.InterpType.BILINEAR)
+    return pixbuf
+
+
+def _spline_path(cr, pts):
+    """Add a Catmull-Rom spline through *pts* to *cr* as cubic Béziers."""
+    cr.move_to(*pts[0])
+    if len(pts) == 2:
+        cr.line_to(*pts[1])
+        return
+    for i in range(len(pts) - 1):
+        p0 = pts[i - 1] if i > 0 else pts[i]
+        p1, p2 = pts[i], pts[i + 1]
+        p3 = pts[i + 2] if i + 2 < len(pts) else p2
+        cr.curve_to(
+            p1[0] + (p2[0] - p0[0]) / 6.0, p1[1] + (p2[1] - p0[1]) / 6.0,
+            p2[0] - (p3[0] - p1[0]) / 6.0, p2[1] - (p3[1] - p1[1]) / 6.0,
+            p2[0], p2[1],
+        )
+
+
+def _draw_strokes(cairo, cr, strokes, rgb_for_role):
+    """Draw *strokes* opaquely with round caps, one colour per role."""
+    cr.set_line_cap(cairo.LINE_CAP_ROUND)
+    cr.set_line_join(cairo.LINE_JOIN_ROUND)
+    for stroke in strokes:
+        pts, radius = stroke['pts'], stroke['r']
+        if not pts:
+            continue
+        cr.set_source_rgb(*rgb_for_role(stroke['role']))
+        if len(pts) == 1:
+            cr.arc(pts[0][0], pts[0][1], radius, 0, 2 * math.pi)
+            cr.fill()
+            continue
+        _spline_path(cr, pts)
+        cr.set_line_width(2 * radius)
+        cr.stroke()
+
+
+def _render_marks(cairo, strokes, size):
+    """{'keep_mask': png, 'remove_mask': png} (white on transparent) for *strokes*."""
+    masks = {}
+    for role in ('keep', 'remove'):
+        mine = [s for s in strokes if s['role'] == role]
+        if not mine:
+            continue
+        surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, size[0], size[1])
+        cr = cairo.Context(surface)
+        _draw_strokes(cairo, cr, mine, lambda _role: (1.0, 1.0, 1.0))
+        surface.flush()
+        buf = io.BytesIO()
+        surface.write_to_png(buf)
+        masks[f'{role}_mask'] = buf.getvalue()
+    return masks
+
+
+def _strokes_to_json(strokes, size):
+    return json.dumps({
+        'w': size[0], 'h': size[1],
+        'strokes': [
+            {'role': s['role'], 'r': round(s['r'], 2),
+             'pts': [[round(x, 1), round(y, 1)] for x, y in s['pts']]}
+            for s in strokes
+        ],
+    }, separators=(',', ':')).encode()
+
+
+def _strokes_from_json(data, size):
+    """Strokes saved by _strokes_to_json(), rescaled to *size*; [] if unreadable."""
+    try:
+        doc = json.loads(data)
+        sx, sy = size[0] / doc['w'], size[1] / doc['h']
+        out = []
+        for s in doc['strokes']:
+            if s['role'] not in ('keep', 'remove'):
+                continue
+            out.append({'role': s['role'], 'r': float(s['r']) * (sx + sy) / 2,
+                        'pts': [(float(x) * sx, float(y) * sy) for x, y in s['pts']]})
+        return out
+    except Exception:
+        return []
+
+
+class SmartBrushDialog:
+    """Draw-on-the-cutout Smart brush dialog.
+
+    *photo_png* / *matte_png*: the layer and its mask, at *size*.
+    *prepare(masks)*: main thread; gets {'keep_mask': png, ...} and returns a
+      callable run on a worker thread (the network request); its result goes to
+    *commit(result, history)*: main thread; updates GIMP and returns the new
+      matte PNG for the preview.
+    *stateless*: Pro — every Apply sends all strokes since the cutout
+      (*history*); the local server keeps that history itself.
+    """
+
+    def __init__(self, cairo, photo_png, matte_png, size, prepare, commit,
+                 stateless=False, history=None, engine_label='',
+                 dialog_factory=None):
+        self.cairo = cairo
+        self.size = tuple(size)
+        self.prepare = prepare
+        self.commit = commit
+        self.stateless = stateless
+        self.history = list(history or [])   # applied strokes (Pro only)
+        self.strokes = []                    # pending strokes
+        self.current = None                  # stroke being drawn
+        self.smooth = None                   # stabilised pen position
+        self.pointer = None                  # widget coords, for the brush outline
+        self.busy = False
+        self.close_after_apply = False
+        self.applies = 0
+
+        self.photo = Gdk.cairo_surface_create_from_pixbuf(_pixbuf_from_png(photo_png, self.size), 1, None)
+        self.matte = self._matte_surface(matte_png)
+        self.base = None
+
+        self._build(dialog_factory, engine_label)
+        self._rebuild_base()
+
+    # ── UI ───────────────────────────────────────────────────────────────
+
+    def _build(self, dialog_factory, engine_label):
+        title = 'WithoutBG — Smart Brush'
+        self.dialog = dialog_factory(title) if dialog_factory else Gtk.Dialog(title=title)
+        d = self.dialog
+        d.set_resizable(True)
+        self.apply_button = d.add_button('_Apply', RESPONSE_APPLY)
+        self.done_button = d.add_button('_Done', Gtk.ResponseType.CLOSE)
+        d.set_default_response(RESPONSE_APPLY)
+        d.connect('response', self._on_response)
+        d.connect('delete-event', self._on_delete)
+        d.connect('key-press-event', self._on_key)
+
+        box = d.get_content_area()
+        box.set_spacing(8)
+        box.set_border_width(10)
+
+        # Row 1: brush mode, size, background opacity.
+        bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        box.pack_start(bar, False, False, 0)
+
+        modes = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        modes.get_style_context().add_class('linked')
+        self.keep_btn = Gtk.RadioButton.new(None)
+        self.remove_btn = Gtk.RadioButton.new_from_widget(self.keep_btn)
+        for btn, label, rgb, tip in (
+            (self.keep_btn, 'Keep', BRUSH_KEEP_RGB, 'Green: paint what went missing (X to switch)'),
+            (self.remove_btn, 'Remove', BRUSH_REMOVE_RGB, 'Red: paint what should go (X to switch)'),
+        ):
+            btn.set_mode(False)   # toggle-button look
+            hexcol = '#%02x%02x%02x' % tuple(int(c * 255) for c in rgb)
+            lab = Gtk.Label()
+            lab.set_markup(f'<span foreground="{hexcol}">●</span>  {label}')
+            btn.add(lab)
+            btn.set_tooltip_text(tip)
+            btn.connect('toggled', lambda *_: self.area.queue_draw())
+            modes.pack_start(btn, False, False, 0)
+        bar.pack_start(modes, False, False, 0)
+
+        bar.pack_start(Gtk.Label(label='Brush size'), False, False, 0)
+        self.size_adj = Gtk.Adjustment(value=BRUSH_DEFAULT_PX, lower=2, upper=300,
+                                       step_increment=1, page_increment=10)
+        size_scale = Gtk.Scale(orientation=Gtk.Orientation.HORIZONTAL, adjustment=self.size_adj)
+        size_scale.set_draw_value(False)
+        size_scale.set_size_request(120, -1)
+        size_spin = Gtk.SpinButton(adjustment=self.size_adj, climb_rate=1, digits=0)
+        size_spin.set_tooltip_text('Brush diameter in screen pixels ( [ and ] to change )')
+        self.size_adj.connect('value-changed', lambda *_: self.area.queue_draw())
+        bar.pack_start(size_scale, False, False, 0)
+        bar.pack_start(size_spin, False, False, 0)
+
+        bar.pack_start(Gtk.Label(label='Background'), False, False, 0)
+        self.bg_adj = Gtk.Adjustment(value=BG_OPACITY_PCT, lower=0, upper=100,
+                                     step_increment=1, page_increment=10)
+        bg_scale = Gtk.Scale(orientation=Gtk.Orientation.HORIZONTAL, adjustment=self.bg_adj)
+        bg_scale.set_digits(0)
+        bg_scale.set_value_pos(Gtk.PositionType.RIGHT)
+        bg_scale.set_size_request(140, -1)
+        bg_scale.set_tooltip_text('Opacity of the removed background, so you can see what is there')
+        bg_scale.connect('format-value', lambda _s, v: f'{v:.0f}%')
+        self.bg_adj.connect('value-changed', lambda *_: (self._rebuild_base(), self.area.queue_draw()))
+        bar.pack_start(bg_scale, True, True, 0)
+
+        self.clear_btn = Gtk.Button(label='Clear')
+        self.clear_btn.set_tooltip_text('Remove all strokes not applied yet')
+        self.clear_btn.connect('clicked', lambda *_: self._clear())
+        self.undo_btn = Gtk.Button(label='Undo stroke')
+        self.undo_btn.set_tooltip_text('Remove the last stroke (Ctrl+Z)')
+        self.undo_btn.connect('clicked', lambda *_: self._undo())
+        bar.pack_end(self.clear_btn, False, False, 0)
+        bar.pack_end(self.undo_btn, False, False, 0)
+
+        # Canvas.
+        frame = Gtk.Frame()
+        frame.set_shadow_type(Gtk.ShadowType.IN)
+        self.area = Gtk.DrawingArea()
+        self.area.set_can_focus(True)
+        w, h = self.size
+        fit = min(1.0, 860 / w, 600 / h)
+        self.area.set_size_request(max(320, int(w * fit)), max(240, int(h * fit)))
+        self.area.add_events(
+            Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK
+            | Gdk.EventMask.POINTER_MOTION_MASK | Gdk.EventMask.LEAVE_NOTIFY_MASK
+            | Gdk.EventMask.SCROLL_MASK | Gdk.EventMask.SMOOTH_SCROLL_MASK
+        )
+        self.area.connect('draw', self._on_draw)
+        self.area.connect('button-press-event', self._on_press)
+        self.area.connect('motion-notify-event', self._on_motion)
+        self.area.connect('button-release-event', self._on_release)
+        self.area.connect('leave-notify-event', self._on_leave)
+        self.area.connect('scroll-event', self._on_scroll)
+        self.area.connect('realize', self._on_realize)
+        frame.add(self.area)
+        box.pack_start(frame, True, True, 0)
+
+        # Status line.
+        status = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.spinner = Gtk.Spinner()
+        self.status = Gtk.Label(xalign=0)
+        self.status.set_line_wrap(True)
+        status.pack_start(self.spinner, False, False, 0)
+        status.pack_start(self.status, True, True, 0)
+        box.pack_start(status, False, False, 0)
+        self._hint = (
+            'Rough strokes are enough: green over what went missing, red over what should go. '
+            'Right-drag paints the other colour. Apply updates the mask; Done closes.'
+            + (f'  ·  {engine_label}' if engine_label else '')
+        )
+        self._set_status(self._hint)
+        self._sync_buttons()
+
+    def _set_status(self, text, error=False):
+        if error:
+            self.status.set_markup(f'<span foreground="#d33">{GLib.markup_escape_text(text)}</span>')
+        else:
+            self.status.set_text(text)
+
+    def _sync_buttons(self):
+        pending = bool(self.strokes)
+        self.apply_button.set_sensitive(pending and not self.busy)
+        self.done_button.set_sensitive(not self.busy)
+        self.undo_btn.set_sensitive(pending)
+        self.clear_btn.set_sensitive(pending)
+
+    # ── Preview ──────────────────────────────────────────────────────────
+
+    def _matte_surface(self, matte_png):
+        """The mask as a cairo A8 surface (gray value → alpha)."""
+        cairo = self.cairo
+        pixbuf = _pixbuf_from_png(matte_png, self.size)
+        w, h = self.size
+        nc, rs = pixbuf.get_n_channels(), pixbuf.get_rowstride()
+        pixels = pixbuf.get_pixels()
+        stride = cairo.ImageSurface.format_stride_for_width(cairo.FORMAT_A8, w)
+        data = bytearray(stride * h)
+        for y in range(h):
+            data[y * stride:y * stride + w] = pixels[y * rs:y * rs + w * nc:nc]
+        return cairo.ImageSurface.create_for_data(data, cairo.FORMAT_A8, w, h, stride)
+
+    def _rebuild_base(self):
+        """Checkerboard + faded photo (background) + the cutout at full opacity."""
+        cairo = self.cairo
+        w, h = self.size
+        base = cairo.ImageSurface(cairo.FORMAT_ARGB32, w, h)
+        cr = cairo.Context(base)
+        tile = max(8, round(max(w, h) / 64))
+        cr.set_source_rgb(0.80, 0.80, 0.80)
+        cr.paint()
+        cr.set_source_rgb(0.62, 0.62, 0.62)
+        for ty in range(0, h, tile):
+            for tx in range((ty // tile) % 2 * tile, w, 2 * tile):
+                cr.rectangle(tx, ty, tile, tile)
+        cr.fill()
+        cr.set_source_surface(self.photo, 0, 0)
+        cr.paint_with_alpha(self.bg_adj.get_value() / 100.0)
+        cr.set_source_surface(self.photo, 0, 0)
+        cr.mask_surface(self.matte, 0, 0)
+        base.flush()
+        self.base = base
+
+    def _view(self):
+        """(scale, offset_x, offset_y) mapping preview pixels to the widget."""
+        aw, ah = self.area.get_allocated_width(), self.area.get_allocated_height()
+        w, h = self.size
+        scale = min(aw / w, ah / h, 4.0)
+        return scale, (aw - w * scale) / 2, (ah - h * scale) / 2
+
+    def _to_image(self, x, y):
+        scale, ox, oy = self._view()
+        return (x - ox) / scale, (y - oy) / scale
+
+    def _role_rgb(self, role):
+        return BRUSH_KEEP_RGB if role == 'keep' else BRUSH_REMOVE_RGB
+
+    def _active_role(self, button=1):
+        role = 'keep' if self.keep_btn.get_active() else 'remove'
+        if button == 3:
+            role = 'remove' if role == 'keep' else 'keep'
+        return role
+
+    def _on_draw(self, area, cr):
+        cairo = self.cairo
+        cr.set_source_rgb(0.18, 0.18, 0.18)
+        cr.paint()
+        scale, ox, oy = self._view()
+        if scale <= 0:
+            return False
+        cr.save()
+        cr.translate(ox, oy)
+        cr.scale(scale, scale)
+        cr.set_source_surface(self.base, 0, 0)
+        cr.get_source().set_filter(cairo.FILTER_GOOD)
+        cr.paint()
+        strokes = self.strokes + ([self.current] if self.current else [])
+        if strokes:
+            # Paint all strokes opaque in a group, then fade once: overlaps don't darken.
+            cr.rectangle(0, 0, *self.size)
+            cr.clip()
+            cr.push_group()
+            _draw_strokes(cairo, cr, strokes, self._role_rgb)
+            cr.pop_group_to_source()
+            cr.paint_with_alpha(BRUSH_ALPHA)
+        cr.restore()
+
+        if self.pointer is not None and not self.busy:
+            x, y = self.pointer
+            r = self.size_adj.get_value() / 2
+            cr.set_line_width(3)
+            cr.set_source_rgba(0, 0, 0, 0.6)
+            cr.arc(x, y, r, 0, 2 * math.pi)
+            cr.stroke()
+            cr.set_line_width(1.5)
+            role = self.current['role'] if self.current else self._active_role()
+            cr.set_source_rgb(*self._role_rgb(role))
+            cr.arc(x, y, r, 0, 2 * math.pi)
+            cr.stroke()
+        return False
+
+    # ── Painting ─────────────────────────────────────────────────────────
+
+    def _on_realize(self, area):
+        try:
+            area.get_window().set_cursor(Gdk.Cursor.new_from_name(area.get_display(), 'crosshair'))
+        except Exception:
+            pass
+
+    def _on_press(self, area, event):
+        area.grab_focus()
+        if event.type != Gdk.EventType.BUTTON_PRESS or event.button not in (1, 3):
+            return False
+        scale, _ox, _oy = self._view()
+        p = self._to_image(event.x, event.y)
+        self.smooth = p
+        self.current = {'role': self._active_role(event.button),
+                        'r': self.size_adj.get_value() / 2 / scale, 'pts': [p]}
+        area.queue_draw()
+        return True
+
+    def _on_motion(self, area, event):
+        self.pointer = (event.x, event.y)
+        if self.current is not None:
+            # Stabiliser: the pen trails the pointer, which irons out jitter.
+            px, py = self._to_image(event.x, event.y)
+            sx, sy = self.smooth
+            sx += (px - sx) * BRUSH_SMOOTHING
+            sy += (py - sy) * BRUSH_SMOOTHING
+            self.smooth = (sx, sy)
+            lx, ly = self.current['pts'][-1]
+            scale, _ox, _oy = self._view()
+            if math.hypot(sx - lx, sy - ly) * scale >= 3.0:
+                self.current['pts'].append((sx, sy))
+        area.queue_draw()
+        return True
+
+    def _on_release(self, area, event):
+        if self.current is None:
+            return False
+        stroke, self.current = self.current, None
+        if self.smooth is not None and len(stroke['pts']) > 1:
+            stroke['pts'].append(self.smooth)
+        self.strokes.append(stroke)
+        self._set_status(f'{len(self.strokes)} stroke(s) ready. Apply to update the mask.')
+        self._sync_buttons()
+        area.queue_draw()
+        return True
+
+    def _on_leave(self, area, event):
+        self.pointer = None
+        area.queue_draw()
+        return False
+
+    def _on_scroll(self, area, event):
+        if not event.state & Gdk.ModifierType.CONTROL_MASK:
+            return False
+        ok, dx, dy = event.get_scroll_deltas()
+        if not ok:
+            dy = {Gdk.ScrollDirection.UP: -1, Gdk.ScrollDirection.DOWN: 1}.get(event.direction, 0)
+        self._resize_brush(1.0 / 1.15 if dy > 0 else 1.15)
+        return True
+
+    def _resize_brush(self, factor):
+        self.size_adj.set_value(round(self.size_adj.get_value() * factor) or 2)
+
+    def _on_key(self, widget, event):
+        if isinstance(self.dialog.get_focus(), Gtk.Entry):
+            return False
+        key = Gdk.keyval_name(event.keyval) or ''
+        if event.state & Gdk.ModifierType.CONTROL_MASK and key.lower() == 'z':
+            self._undo()
+            return True
+        if key.lower() == 'x':
+            (self.remove_btn if self.keep_btn.get_active() else self.keep_btn).set_active(True)
+            return True
+        if key == 'bracketleft':
+            self._resize_brush(1.0 / 1.2)
+            return True
+        if key == 'bracketright':
+            self._resize_brush(1.2)
+            return True
+        return False
+
+    def _undo(self):
+        if self.strokes:
+            self.strokes.pop()
+            self._sync_buttons()
+            self.area.queue_draw()
+
+    def _clear(self):
+        self.strokes = []
+        self._sync_buttons()
+        self.area.queue_draw()
+
+    # ── Apply / Done ─────────────────────────────────────────────────────
+
+    def _apply(self):
+        if self.busy or not self.strokes:
+            return
+        sent = list(self.strokes)
+        to_send = self.history + sent if self.stateless else sent
+        try:
+            work = self.prepare(_render_marks(self.cairo, to_send, self.size))
+        except Exception as exc:
+            self._finish(sent, None, exc)
+            return
+        self.busy = True
+        self.spinner.start()
+        self._set_status('Applying Smart brush…')
+        self._sync_buttons()
+        self.area.queue_draw()
+
+        def run():
+            try:
+                result, error = work(), None
+            except Exception as exc:
+                result, error = None, exc
+            GLib.idle_add(self._finish, sent, result, error)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _finish(self, sent, result, error):
+        self.busy = False
+        self.spinner.stop()
+        if error is None:
+            history = self.history + sent if self.stateless else []
+            try:
+                matte_png = self.commit(result, history)
+                self.matte = self._matte_surface(matte_png)
+                self._rebuild_base()
+            except Exception as exc:
+                error = exc
+            else:
+                self.history = history
+                # Strokes painted while the request ran stay pending.
+                self.strokes = self.strokes[len(sent):]
+                self.applies += 1
+                self._set_status('Mask updated. Keep painting and Apply again, or Done to close.')
+        if error is not None:
+            self.close_after_apply = False
+            self._set_status(f'Apply failed: {error}', error=True)
+        self._sync_buttons()
+        self.area.queue_draw()
+        if self.close_after_apply and error is None:
+            self._close()
+        return False
+
+    def _confirm_close(self):
+        """True when the dialog may close now (asks about unapplied strokes)."""
+        if not self.strokes:
+            return True
+        msg = Gtk.MessageDialog(
+            transient_for=self.dialog, modal=True,
+            message_type=Gtk.MessageType.QUESTION, buttons=Gtk.ButtonsType.NONE,
+            text=f'Apply {len(self.strokes)} unapplied stroke(s) before closing?',
+        )
+        msg.add_buttons('_Discard', Gtk.ResponseType.NO, '_Cancel', Gtk.ResponseType.CANCEL,
+                        '_Apply', Gtk.ResponseType.YES)
+        msg.set_default_response(Gtk.ResponseType.YES)
+        answer = msg.run()
+        msg.destroy()
+        if answer == Gtk.ResponseType.YES:
+            self.close_after_apply = True
+            self._apply()
+            return False
+        return answer == Gtk.ResponseType.NO
+
+    def _on_response(self, dialog, response):
+        if response == RESPONSE_APPLY:
+            self._apply()
+        elif response in (Gtk.ResponseType.CLOSE, Gtk.ResponseType.DELETE_EVENT):
+            if not self.busy and self._confirm_close():
+                self._close()
+
+    def _on_delete(self, dialog, event):
+        self._on_response(dialog, Gtk.ResponseType.DELETE_EVENT)
+        return True   # never destroy here; _close() hides and quits
+
+    def _close(self):
+        self.dialog.hide()
+        Gtk.main_quit()
+
+    def run(self):
+        self.dialog.show_all()
+        self.area.grab_focus()
+        Gtk.main()
+        self.dialog.destroy()
+        return self.applies
+
+
 # ── Procedure callback ────────────────────────────────────────────────────────
 
 def run_remove_background(procedure, run_mode, image, drawables, config, data):
@@ -594,7 +1164,7 @@ def run_remove_background(procedure, run_mode, image, drawables, config, data):
                 + _server_status_markup(server_url) + '\n\n'
                 'Optional: withoutBG Pro sends the layer to api.withoutbg.com\n'
                 f'(1 credit per image). API key: {PRO_KEY_URL}\n\n'
-                'To fix the mask: Tools ▸ WithoutBG ▸ Smart Brush (local server; Pro cutouts\n'
+                'To fix the mask: Tools ▸ WithoutBG ▸ Smart Brush… (local server; Pro cutouts\n'
                 'need WITHOUTBG_API_KEY in the environment).',
             )
             dialog.get_content_area().add(hint)
@@ -680,6 +1250,7 @@ def run_remove_background(procedure, run_mode, image, drawables, config, data):
                 matte_img.delete()
                 # A new cutout: Smart brush starts from it with a fresh context.
                 _clear_parasite(target, CONTEXT_PARASITE)
+                _clear_parasite(target, STROKES_PARASITE)
                 # Remember which engine made it; Smart brush Apply follows it.
                 _set_parasite_bytes(target, ENGINE_PARASITE, b'pro' if use_pro else b'open')
                 if use_pro:
@@ -824,6 +1395,130 @@ def _smart_brush_apply_pro(procedure, image, target, paint, painted):
     return procedure.new_return_values(Gimp.PDBStatusType.SUCCESS, GLib.Error())
 
 
+def _apply_matte_bytes(image, target, matte_png):
+    """Load *matte_png* into *target*'s layer mask (one undo step)."""
+    path = tempfile.mktemp(suffix='_wbg_matte.png')
+    try:
+        with open(path, 'wb') as fh:
+            fh.write(matte_png)
+        matte_img = Gimp.file_load(Gimp.RunMode.NONINTERACTIVE, Gio.File.new_for_path(path))
+        if matte_img is None:
+            raise RuntimeError('GIMP could not load the matte PNG.')
+        image.undo_group_start()
+        try:
+            _add_matte_mask(image, target, matte_img)
+        finally:
+            image.undo_group_end()
+            matte_img.delete()
+        Gimp.displays_flush()
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def _read_temp_png(export):
+    """Call *export(path)* with a temp PNG path and return the file's bytes."""
+    path = tempfile.mktemp(suffix='_wbg.png')
+    try:
+        export(path)
+        with open(path, 'rb') as fh:
+            return fh.read()
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def run_smart_brush_dialog(procedure, run_mode, image, drawables, config, data):
+    """Smart brush: paint Keep / Remove strokes on a preview, Apply updates the mask."""
+    try:
+        target = _smart_brush_target(image, drawables)
+        if target is None:
+            return _fail(procedure, 'Select the layer you removed the background from.')
+        if target.get_mask() is None:
+            return _fail(procedure, 'This layer has no mask yet. Run Tools ▸ WithoutBG ▸ '
+                                    'Remove Background first.')
+        cairo = _load_cairo()
+        if cairo is None:
+            return _fail(procedure, 'The Smart Brush dialog needs pycairo, which this GIMP '
+                                    'build lacks. Use Smart Brush: Add Paint Layers / Apply instead.')
+
+        pro = _get_parasite_bytes(target, ENGINE_PARASITE) == b'pro'
+        api_key = os.environ.get('WITHOUTBG_API_KEY', '').strip()
+        server_url = _remembered_server()
+        if pro:
+            if not api_key:
+                return _fail(procedure, 'Smart brush on a withoutBG Pro cutout needs the API key in '
+                                        'WITHOUTBG_API_KEY. Set it and restart GIMP.')
+            engine_label = 'withoutBG Pro: 1 credit per Apply'
+        else:
+            ok, info = _health_check(server_url)
+            if not ok:
+                return _fail(procedure, f'Smart brush runs on the local open-weights server.\n'
+                                        f'Cannot reach it at {server_url}.\n\n{info}')
+            engine_label = f'Local server {server_url}'
+
+        size = _fit_longest_side(target.get_width(), target.get_height())
+        photo_png = _read_temp_png(lambda p: _export_layer_png(image, target, p, MAX_SERVER_SIDE))
+        matte_png = _read_temp_png(lambda p: _export_mask_png(target, p, size))
+        history = []
+        if pro:
+            saved = _get_parasite_bytes(target, STROKES_PARASITE)
+            history = _strokes_from_json(saved, size) if saved else []
+
+        if pro:
+            def prepare(masks):
+                return lambda: _post_pro(photo_png, api_key, masks)[0]
+
+            def commit(result, all_strokes):
+                _apply_matte_bytes(image, target, result)
+                _set_parasite_bytes(target, STROKES_PARASITE, _strokes_to_json(all_strokes, size))
+                return result
+        else:
+            def prepare(masks):
+                # Start from the mask as it is now: hand edits since the last Apply count.
+                body = {
+                    'image': 'data:image/png;base64,' + base64.b64encode(photo_png).decode('ascii'),
+                    'matte': 'data:image/png;base64,' + base64.b64encode(
+                        _read_temp_png(lambda p: _export_mask_png(target, p, size))).decode('ascii'),
+                }
+                for name, png in masks.items():
+                    body[name] = 'data:image/png;base64,' + base64.b64encode(png).decode('ascii')
+                context = _get_parasite_bytes(target, CONTEXT_PARASITE)
+                if context:
+                    body['edit_context'] = context.decode('ascii', 'replace')
+                return lambda: _post_json(server_url, body)
+
+            def commit(reply, _history):
+                matte = _decode_data_url(reply['alphaMatte'])
+                _apply_matte_bytes(image, target, matte)
+                if reply.get('editContext'):
+                    _set_parasite_bytes(target, CONTEXT_PARASITE, reply['editContext'].encode('ascii'))
+                return matte
+
+        GimpUi.init('withoutbg.py')
+
+        def make_dialog(title):
+            dialog = GimpUi.Dialog(title=title, role='withoutbg-smart-brush', use_header_bar=False)
+            try:
+                GimpUi.window_set_transient(dialog)
+            except Exception:
+                pass
+            return dialog
+
+        SmartBrushDialog(
+            cairo, photo_png, matte_png, size, prepare, commit,
+            stateless=pro, history=history, engine_label=engine_label,
+            dialog_factory=make_dialog,
+        ).run()
+        return procedure.new_return_values(Gimp.PDBStatusType.SUCCESS, GLib.Error())
+    except Exception as exc:
+        return _fail(procedure, f'{exc}\n\n{traceback.format_exc()}')
+
+
 def run_smart_brush_apply(procedure, run_mode, image, drawables, config, data):
     """Send the paint to the local server and update the layer mask in place."""
     try:
@@ -912,11 +1607,20 @@ class WithoutBGPlugin(Gimp.PlugIn):
     def do_query_procedures(self):
         return [
             'withoutbg-remove-background',
+            'withoutbg-smart-brush',
             'withoutbg-smart-brush-layers',
             'withoutbg-smart-brush-apply',
         ]
 
     def do_create_procedure(self, name):
+        if name == 'withoutbg-smart-brush':
+            return self._smart_brush_procedure(
+                name, run_smart_brush_dialog, 'Smart Brush…',
+                'Fix the layer mask by painting on a preview',
+                'Opens a dialog showing the cutout: paint rough green (keep) and '
+                'red (remove) strokes, Apply to update the layer mask in place, '
+                'Done to close.',
+            )
         if name == 'withoutbg-smart-brush-layers':
             return self._smart_brush_procedure(
                 name, run_add_paint_layers, 'Smart Brush: Add Paint Layers',

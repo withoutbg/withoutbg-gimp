@@ -68,13 +68,23 @@ The plugin adds an unapplied layer mask from the server’s alpha matte. Review 
 
 Something went missing, or a bit of background stayed? Paint over it instead of fixing the mask by hand:
 
-1. **Tools ▸ WithoutBG ▸ Smart Brush: Add Paint Layers.** Two layers appear above yours: **withoutBG Keep** (green tag) and **withoutBG Remove** (red tag).
-2. Paint on them with any brush at full opacity: on Keep, what went missing; on Remove, what should go. One stroke on an object is enough.
-3. **Tools ▸ WithoutBG ▸ Smart Brush: Apply.** The layer mask updates in place (one undo step) and the paint layers are cleared for the next round.
+1. Select the layer and open **Tools ▸ WithoutBG ▸ Smart Brush…**. The dialog shows the cutout on a checkerboard.
+2. Draw right on it. **Keep** (green) goes over what went missing, **Remove** (red) over what should go. Strokes are smoothed, so a rough line is enough. One stroke on an object will do.
+3. Click **Apply**. The layer mask updates in place (one undo step) and the dialog shows the new cutout. Paint more and Apply again, or click **Done** to close.
 
-Repeat 2–3 as often as you like. Hand edits to the mask are kept: Smart brush starts from the mask as it is. After the first Apply, later ones on the same layer are much faster: the server runs only the Smart brush model, not the full pipeline (the plugin keeps a small edit context on the layer, saved with XCF files).
+Dialog controls:
 
-Smart brush runs on the local open-weights server (Docker or the Mac app, v4). On a cutout made with withoutBG Pro it runs on Pro instead: each Apply sends the photo and every stroke so far (stateless, 1 credit per Apply), so paint stays on the layers until the cutout is replaced. Pro Smart brush needs `WITHOUTBG_API_KEY` in the environment. Like Remove Background, it works at up to 1024 px and the mask is scaled back to the layer size.
+- **Brush size**: the slider or the number field (also `[` / `]`, or Ctrl + scroll).
+- **Background**: how much of the removed background shows through, so you can see what is there.
+- **Undo stroke** (Ctrl+Z) and **Clear** remove strokes you have not applied yet.
+- `X` switches between Keep and Remove. Right-drag paints with the other colour.
+- **Done** asks before discarding strokes you have not applied.
+
+Hand edits to the mask are kept: Smart brush starts from the mask as it is. After the first Apply, later ones on the same layer are much faster: the server runs only the Smart brush model, not the full pipeline (the plugin keeps a small edit context on the layer, saved with XCF files).
+
+If you prefer GIMP's own brushes, **Smart Brush: Add Paint Layers** adds **withoutBG Keep** and **withoutBG Remove** layers to paint on at full opacity, and **Smart Brush: Apply** sends them.
+
+Smart brush runs on the local open-weights server (Docker or the Mac app, v4). On a cutout made with withoutBG Pro it runs on Pro instead: each Apply sends the photo and every stroke so far (stateless, 1 credit per Apply), so strokes are kept (on the layer, or in the paint layers) until the cutout is replaced. Pro Smart brush needs `WITHOUTBG_API_KEY` in the environment. Like Remove Background, it works at up to 1024 px and the mask is scaled back to the layer size.
 
 ## Configuration
 
