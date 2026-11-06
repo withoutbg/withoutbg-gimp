@@ -51,7 +51,7 @@ SERVER_URL = "http://127.0.0.1:8000"
 
 # withoutBG Pro (opt-in). Key from the dialog, or the WITHOUTBG_API_KEY env var.
 PRO_API_URL = os.environ.get("WITHOUTBG_API_URL", "https://api.withoutbg.com").rstrip("/")
-DOCKER_DOCS_URL = "https://withoutbg.com/docs/open-model/docker"
+PLUGIN_DOCS_URL = "https://withoutbg.com/open-model/plugins/gimp"
 PRO_KEY_URL = "https://withoutbg.com/pro-model-api?utm_source=gimp&utm_medium=plugin&utm_campaign=open-weights-v4&utm_content=withoutbg-gimp-dialog"
 
 # The server downsamples input so the longest side is at most this many pixels.
@@ -1193,8 +1193,7 @@ def run_remove_background(procedure, run_mode, image, drawables, config, data):
             dialog.get_content_area().add(hint)
             hint.show()
             links = _link_label([
-                ('Run the local server with Docker', DOCKER_DOCS_URL),
-                ('Get a withoutBG Pro API key', PRO_KEY_URL),
+                ('Setup guide: local server, withoutBG Pro and Smart Brush', PLUGIN_DOCS_URL),
             ])
             dialog.get_content_area().add(links)
             links.show()
